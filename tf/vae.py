@@ -2,7 +2,7 @@ import tensorflow as tf
 
 from keras import Model
 from keras.optimizers import Adam
-from keras.layers import Dense, LeakyReLU
+from keras.layers import Dense
 from keras.losses import MeanSquaredError
 from keras.metrics import Mean
 
@@ -15,8 +15,7 @@ class Encoder(Model):
     ):
         super().__init__(name=name)
 
-        self.leaky = LeakyReLU()
-        self.hidden = Dense(hidden_dim, name="encoder-hidden", activation=self.leaky)
+        self.hidden = Dense(hidden_dim, name="encoder-hidden", activation="relu")
         
 
         self.mean = Dense(latent_dim, name="encoder-mean")
@@ -43,12 +42,10 @@ class Decoder(Model):
         name="vae-decoder"
     ):
         super().__init__(name=name)
-        
-        self.leaky = LeakyReLU()
 
-        self.hidden = Dense(hidden_dim, activation=self.leaky)
+        self.hidden = Dense(hidden_dim, activation="relu")
 
-        self.op = Dense(origin_dim)
+        self.op = Dense(origin_dim, activation="sigmoid")
 
     def call(self, x):
         x = self.hidden(x)
@@ -160,7 +157,7 @@ class VAETrainer():
         with strategy.scope():
             self.vae = VAE(self.input_dim, hidden_dim=hidden_dim, latent_dim=latent_dim, checkpoint_path=checkpoint_path)
 
-        self.optimizer = Adam(learning_rate=2e-6)
+        self.optimizer = Adam(learning_rate=2e-5)
         self.vae.compile(optimizer=self.optimizer)
         
         if data_folder is not None:
@@ -168,12 +165,12 @@ class VAETrainer():
                 data_folder,
                 labels=None,
                 batch_size=None,
-                color_mode="rgb",
+                color_mode= "rgb" if input_chan == 3 else "grayscale",
                 image_size=(self.img_w, self.img_h),
                 crop_to_aspect_ratio=True
             )
 
-            self.train_ds = tds.batch(self.batch, drop_remainder=True).shuffle(1024).map(self.preproc_batch)
+            self.train_ds = tds.batch(self.batch, drop_remainder=True).shuffle(1024).map(self.preproc_batch).cache()
 
             self.callbacks = []
 
@@ -214,13 +211,14 @@ class VAETrainer():
 
 def train():
     trainer = VAETrainer(
-        192,
-        256,
-        512,
-        "image",
-        hidden_dim=1024,
-        latent_dim=512,
-        checkpoint_path="tf/saved/checkpoint/cp.ckpt"
+        28,
+        28,
+        1024,
+        "image/mnist-img/train",
+        input_chan=1,
+        hidden_dim=512,
+        latent_dim=256,
+        checkpoint_path="tf/saved/vae/checkpoint/cp.ckpt"
     )
 
     trainer.summary()
@@ -230,43 +228,57 @@ def train():
 
 def save():
     trainer = VAETrainer(
-        192,
-        256,
-        512,
+        28,
+        28,
+        1024,
         "image",
-        hidden_dim=1024,
-        latent_dim=512,
-        checkpoint_path="tf/saved/checkpoint/cp.ckpt"
+        input_chan=1,
+        hidden_dim=512,
+        latent_dim=256,
+        checkpoint_path="tf/saved/vae/checkpoint/cp.ckpt"
     )
 
     trainer.summary()
 
-    trainer.save_encoder("tf/saved/encoder")
-    trainer.save_decoder("tf/saved/decoder")
+    trainer.save_encoder("tf/saved/vae/encoder")
+    trainer.save_decoder("tf/saved/vae/decoder")
 
 # lets test an encoding
 def test():
     from PIL import Image, ImageShow
     from numpy import asarray
 
-    encoder = tf.saved_model.load("tf/saved/encoder")
-    decoder = tf.saved_model.load("tf/saved/decoder")
+    encoder = tf.saved_model.load("tf/saved/vae/encoder")
+    decoder = tf.saved_model.load("tf/saved/vae/decoder")
 
-    img = Image.open("image/019595_0.jpg")
+    img = Image.open("image/mnist-img/testSample/img_8.jpg").convert('L')
+    # img = img.resize((192, 256))
     data = asarray(img)
 
+    print(data.shape)
+
     tfslice = tf.constant(data, dtype=tf.float32)/255.
-    tfslice = tf.reshape(tfslice, (1, 192 * 256 * 3))
+    tfslice = tf.reshape(tfslice, (1, 28 * 28))
 
     encoded, _, _ = encoder(tfslice)
     print("Encoded: ",encoded.shape)
     decoded = decoder(encoded)
-    decoded = tf.reshape(decoded * 255., shape=(192, 256, 3)).numpy().astype('uint8')
-    print("Decoded: ",decoded.shape, decoded)
+    decoded = tf.reshape(decoded * 255., shape=(28, 28)).numpy().astype('uint8')
+    print("Decoded: ",decoded.shape)
     
-    decodedimg = Image.fromarray(decoded)
+    decodedimg = Image.fromarray(decoded, mode="L")
     ImageShow.show(decodedimg)
 
-test()
-# train()
-# save()
+
+import sys
+
+args = sys.argv
+
+if len(args) == 1 or args[1] == "train":
+    train()
+elif args[1] == "test":
+    test()
+elif args[1] == "save":
+    save()
+else:
+    raise Exception("invalid arg!")
