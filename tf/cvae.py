@@ -5,8 +5,11 @@ from keras import Model, layers
 from keras.optimizers import Adam
 from keras.layers import Conv2D, Conv2DTranspose, Flatten, Dense, Reshape
 from keras.backend import random_normal
-from keras.losses import binary_crossentropy
+from keras import mixed_precision
+# from keras.losses import binary_crossentropy
 from keras.metrics import Mean
+
+import numpy as np
 
 class Sampling(layers.Layer):
     """Uses (z_mean, z_log_var) to sample z, the vector encoding a digit."""
@@ -18,7 +21,7 @@ class Sampling(layers.Layer):
         batch = tf.shape(z_mean)[0]
         dim = tf.shape(z_mean)[1]
         epsilon = random_normal(shape=(batch, dim))
-        return z_mean + tf.exp(0.5 * z_log_var) * epsilon
+        return z_mean + tf.exp(0.5 * z_log_var) * tf.cast(epsilon, dtype=tf.float16)
 
 class Encoder(Model):
     def __init__(
@@ -91,8 +94,8 @@ class CVAE(Model):
     ):
         super().__init__(name=name)
 
-
         self.optimizer = Adam(learning_rate=1e-5)
+        self.optimizer = mixed_precision.LossScaleOptimizer(self.optimizer)
         self.batch = batch
 
         self.encode = Encoder(latent_dim=latent_dim)
@@ -104,6 +107,12 @@ class CVAE(Model):
         self.recon_loss_tracker = Mean(name="reconstruct_loss")
         self.kl_div_loss_tracker = Mean(name="kl_div_loss")
 
+        if checkpoint_path is not None:
+            try:
+                self.load_weights(checkpoint_path)
+            except:
+                print("Model checkpoint not found!")
+
     def call(self, x):
         z_mean, z_var = self.encode(x)
         z = self.sampling([z_mean, z_var])
@@ -112,18 +121,34 @@ class CVAE(Model):
     def train_step(self, data):
         with tf.GradientTape() as tape:
             z_mean, z_log_var, recon = self(data)
+            
+            # tf.print("Data--------------------------------")
+            # tf.print(data[0])
+            # tf.print("Reco--------------------------------")
+            # tf.print(recon[0])
+            # tf.print("Endo--------------------------------")
 
+
+            
             recon_loss = tf.reduce_mean(
-                tf.reduce_sum(
+                tf.reduce_mean(
                     # binary_crossentropy(data, recon), axis=(1, 2)
-                    tf.keras.losses.mean_squared_error(data, recon)
+                    # tf.keras.losses.log_cosh(data, recon), axis=(1, 2)
+                    tf.math.sqrt(tf.keras.losses.mse(data, recon)), axis=(1, 2)
                 )
             )
             # tf.print(tf.keras.losses.mean_squared_error(data, recon).shape)
             kl_loss = -0.5 * (1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var))
-            kl_loss = tf.reduce_mean(tf.reduce_sum(kl_loss, axis=1))
+            kl_loss = tf.reduce_mean(tf.reduce_mean(kl_loss, axis=1))
             total_loss = recon_loss + kl_loss
+            
+            # tf.print("Total loss: ",total_loss)
+
+
+            total_loss = self.optimizer.get_scaled_loss(total_loss)
+
         grads = tape.gradient(total_loss, self.trainable_weights)
+        grads = self.optimizer.get_unscaled_gradients(grads)
         self.optimizer.apply_gradients(zip(grads, self.trainable_weights))
         self.total_loss_tracker.update_state(total_loss)
         self.recon_loss_tracker.update_state(recon_loss)
@@ -168,6 +193,8 @@ class CVAETrainer():
         else:  # Use the Default Strategy
             strategy = tf.distribute.get_strategy()
 
+        mixed_precision.set_global_policy('mixed_float16')
+
         self.img_w = img_w
         self.img_h = img_h
         self.img_c = input_chan
@@ -191,7 +218,7 @@ class CVAETrainer():
                 crop_to_aspect_ratio=True
             )
 
-            self.train_ds = tds.batch(self.batch, drop_remainder=True).shuffle(1024).map(self.preproc_batch).cache()
+            self.train_ds = tds.take(2048).batch(self.batch, drop_remainder=True).shuffle(1024).map(self.preproc_batch).cache()
 
             self.callbacks = []
 
@@ -232,34 +259,36 @@ class CVAETrainer():
     
 
 def train():
-    cvae = CVAETrainer(28, 28, batch_size=1024, latent_dim=32, data_folder="image/mnist-img/trainSample", input_chan=1, checkpoint_path="saved/cvae/checkpoint")
+    cvae = CVAETrainer(192, 192, batch_size=1024, latent_dim=64, data_folder="image/fashion-random/", input_chan=1, checkpoint_path="saved/cvae/checkpoint")
     cvae.summary()
 
-    cvae.fit(epochs=1000)
+    cvae.fit(epochs=100)
 
-    cvae.save_encoder("tf/saved/cvae/encoder")
-    cvae.save_decoder("tf/saved/cvae/decoder")
+    cvae.save_encoder("saved/cvae/encoder")
+    cvae.save_decoder("saved/cvae/decoder")
 
 def test():
     from PIL import Image, ImageShow
     from numpy import asarray
 
-    encoder = tf.saved_model.load("tf/saved/cvae/encoder")
-    decoder = tf.saved_model.load("tf/saved/cvae/decoder")
+    encoder = tf.saved_model.load("saved/cvae/encoder")
+    decoder = tf.saved_model.load("saved/cvae/decoder")
 
-    img = Image.open("image/mnist-img/testSample/img_27.jpg").convert('L')
+    img = Image.open("image/fashion-random/7728.jpg").convert('L').crop((0, 0, 192, 192))
+    # img = Image.open("image/mnist-img/testSample/img_27.jpg").convert('L')
     # img = img.resize((192, 256))
-    data = asarray(img)
 
-    print(data.shape)
+    # print(data.shape)
+    data = asarray(img).reshape((192, 192))
 
-    tfslice = tf.constant(data, dtype=tf.float32)/255.
-    tfslice = tf.reshape(tfslice, (1, 28, 28, 1))
+    tfslice = tf.constant(data, dtype=tf.float16)/255.
+    tfslice = tf.reshape(tfslice, (1, 192, 192, 1))
 
     encoded, _ = encoder(tfslice)
     print("Encoded: ",encoded.shape)
     decoded = decoder(encoded)
-    decoded = tf.reshape(decoded * 255., shape=(28, 28)).numpy().astype('uint8')
+    # decoded = tf.reshape(decoded * 255., shape=(192, 256, 3)).numpy().astype('uint8')
+    decoded = (decoded * 255.).numpy().astype('uint8')[0].reshape((192, 192))
     print("Decoded: ",decoded.shape)
     
     decodedimg = Image.fromarray(decoded, mode="L")
@@ -275,7 +304,10 @@ if len(args) == 1 or args[1] == "train":
 elif args[1] == "test":
     test()
 elif args[1] == "save":
-    pass
-    # save()
+    cvae = CVAETrainer(192, 256, batch_size=512, latent_dim=128, data_folder="image/fashion-random/", input_chan=1, checkpoint_path="saved/cvae/checkpoint")
+    cvae.summary()
+
+    cvae.save_encoder("saved/cvae/encoder")
+    cvae.save_decoder("saved/cvae/decoder")    
 else:
     raise Exception("invalid arg!")
